@@ -1,0 +1,1 @@
+# Compute-continuous-moments-de-ned-in-a-rectangular-region-using-CUDA-and-some-applications
