@@ -1,4 +1,5 @@
 #include "cuda_runtime.h"
+#include "cublas_v2.h"
 #include <cuda.h>
 #include <time.h>
 #include <vector>
@@ -9,8 +10,8 @@
 #include <chrono>
 
 #define K 5
-#define ORD 60   // Legendre polynomial的阶数order
-#define TILE_WIDTH 32 //TILE_WIDTH即block的宽
+#define ORD 40   // Legendre polynomial的阶数order
+#define TILE_WIDTH 32 // block的宽
 
 inline __device__
 float __char_as_float(uchar b8)
@@ -37,7 +38,7 @@ static inline void _safe_cuda_call(cudaError err, const char* msg, const char* f
 #define SAFE_CALL(call,msg) _safe_cuda_call((call),(msg),__FILE__,__LINE__)
 
 // bilinear interpolation, enlarge k times in x and y direction
-__global__ void inter_liner_k(float3 *dataOut, uchar3 *dataIn, int imgHeight, int imgWidth, int imgHeight_k, int imgWidth_k, float scale)
+__global__ void inter_liner_k(float *dataOut, uchar *dataIn, int imgHeight, int imgWidth, int imgHeight_k, int imgWidth_k, float scale)
 {   
   int xIdx = threadIdx.x + blockIdx.x * blockDim.x;	
   int yIdx = threadIdx.y + blockIdx.y * blockDim.y;
@@ -68,22 +69,16 @@ __global__ void inter_liner_k(float3 *dataOut, uchar3 *dataIn, int imgHeight, in
     cbufy.x = 1.f - fy;
     cbufy.y = fy;
 
-    uchar3 s11 = dataIn[sy * imgWidth + sx];
-    uchar3 s12 = dataIn[sy * imgWidth + sx2];
-    uchar3 s21 = dataIn[sy2 * imgWidth + sx];
-    uchar3 s22 = dataIn[sy2 * imgWidth + sx2];
+    uchar s11 = dataIn[sy * imgWidth + sx];
+    uchar s12 = dataIn[sy * imgWidth + sx2];
+    uchar s21 = dataIn[sy2 * imgWidth + sx];
+    uchar s22 = dataIn[sy2 * imgWidth + sx2];
        
     float h_rst00x, h_rst01x, h_rst00y, h_rst01y, h_rst00z, h_rst01z;
-    h_rst00x = s11.x * cbufx.x + s12.x * cbufx.y;
-    h_rst01x = s21.x * cbufx.x + s22.x * cbufx.y;
-    h_rst00y = s11.y * cbufx.x + s12.y * cbufx.y;
-    h_rst01y = s21.y * cbufx.x + s22.y * cbufx.y;
-    h_rst00z = s11.z * cbufx.x + s12.z * cbufx.y;
-    h_rst01z = s21.z * cbufx.x + s22.z * cbufx.y;
+    h_rst00x = s11 * cbufx.x + s12 * cbufx.y;
+    h_rst01x = s21 * cbufx.x + s22 * cbufx.y;
 
-    dataOut[yIdx*imgWidth_k + xIdx].x = (h_rst00x * cbufy.x + h_rst01x * cbufy.y) / 127.5f - 1.f; // B
-    dataOut[yIdx*imgWidth_k + xIdx].y = (h_rst00y * cbufy.x + h_rst01y * cbufy.y) / 127.5f - 1.f; // G
-    dataOut[yIdx*imgWidth_k + xIdx].z = (h_rst00z * cbufy.x + h_rst01z * cbufy.y) / 127.5f - 1.f; // R
+    dataOut[yIdx*imgWidth_k + xIdx] = (h_rst00x * cbufy.x + h_rst01x * cbufy.y) / 127.5f - 1.f; 
   }
 }
 
@@ -135,161 +130,8 @@ __global__ void matrix_transpose(float *odata, const float *idata, int matrixWid
     odata[y*width + x] = tile[threadIdx.x][threadIdx.y];        
 }
 
-__global__ void cal_AC(float3 *AC, float3 *Img, float *P, int imgHeight_k, int imgWidth_k, int total_ph)
-{
-  __shared__ float3 Imgds[TILE_WIDTH][TILE_WIDTH];
-  __shared__ float Pds[TILE_WIDTH][TILE_WIDTH];
-  
-  int bx = blockIdx.x; int by = blockIdx.y;
-  int tx = threadIdx.x; int ty = threadIdx.y;
-
-  // Identify the row and column of the AC element to work on
-  int Row = by * TILE_WIDTH + ty;
-  int Col = bx * TILE_WIDTH + tx;
-
-  // https://bbs.csdn.net/topics/360217239
-  // https://blog.csdn.net/liuyujie3229166/article/details/106888245
-  // result需要初始化，result本来就有值。如果不初始化，每次结果都不一样
-  float3 result;
-  result.x = 0.f; result.y = 0.f; result.z = 0.f;
-  // Loop over the Img and P tiles required to compute AC element
-  for(int ph=0; ph<total_ph; ++ph) 
-  {
-    // Collaborative loading of Img and P tiles into shared memory
-    if((Row<imgHeight_k) && (ph*TILE_WIDTH+tx)<imgWidth_k)
-      Imgds[ty][tx] = Img[Row*imgWidth_k + ph*TILE_WIDTH + tx];
-
-    if((ph*TILE_WIDTH+ty)<imgWidth_k && Col<ORD)
-      Pds[ty][tx] = P[(ph*TILE_WIDTH + ty)*ORD + Col]; 
-    
-    __syncthreads();
-
-    for(int k=0; k<TILE_WIDTH; ++k)
-    {
-      result.x += Imgds[ty][k].x * Pds[k][tx];
-      result.y += Imgds[ty][k].y * Pds[k][tx];
-      result.z += Imgds[ty][k].z * Pds[k][tx];
-    }
-    __syncthreads();
-  }
-  if((Row<imgHeight_k) && (Col<ORD))
-    AC[Row*ORD + Col] = result; 
-}
-
-__constant__ float coff[ORD * ORD];
-// 根据公式(48)，计算图像矩
-__global__ void cal_lambda(float3 *lambda, float *P, float3 *AC, int imgHeight_k, int imgWidth_k, int total_ph)
-{
-  __shared__ float Pds[TILE_WIDTH][TILE_WIDTH];
-  __shared__ float3 ACds[TILE_WIDTH][TILE_WIDTH];
-  
-  int bx = blockIdx.x; int by = blockIdx.y;
-  int tx = threadIdx.x; int ty = threadIdx.y;
-
-  // Identify the row and column of the lambda element to work on
-  int Row = by * TILE_WIDTH + ty;
-  int Col = bx * TILE_WIDTH + tx;
-
-  float3 moments;
-  moments.x = 0.f; moments.y = 0.f; moments.z = 0.f;
-  // Loop over the P and AC tiles required to compute lambda element
-  for(int ph=0; ph<total_ph; ++ph) 
-  {
-    // Collaborative loading of Img and P tiles into shared memory
-    if((Row<ORD) && (ph*TILE_WIDTH+tx)<imgHeight_k)
-      Pds[ty][tx] = P[Row*ORD + ph*TILE_WIDTH+tx];
-
-    if((ph*TILE_WIDTH+ty<imgHeight_k) && Col<ORD)
-      ACds[ty][tx] = AC[(ph*TILE_WIDTH+ty)*ORD + Col];
-    
-    __syncthreads();
-
-    for(int k=0; k<TILE_WIDTH; ++k)
-    {
-      moments.x += Pds[ty][k] * ACds[k][tx].x;
-      moments.y += Pds[ty][k] * ACds[k][tx].y;
-      moments.z += Pds[ty][k] * ACds[k][tx].z;
-    }
-    __syncthreads();
-  }
-  
-  if((Row<ORD) && (Col<ORD))
-  {
-    // lambda[(Row+Col)*ORD + Col].x = moments.x * coff[(Row+Col)*ORD + Col]; // 写入lambda矩阵的顺序错误，系数也不对
-    // lambda[(Row+Col)*ORD + Col].y = moments.y * coff[(Row+Col)*ORD + Col];
-    // lambda[(Row+Col)*ORD + Col].z = moments.z * coff[(Row+Col)*ORD + Col];
-
-    // lambda[(Row+Col)*ORD + Col].x = moments.x * coff[Row*ORD + Col]; // 写入lambda矩阵的顺序错误，系数也不对
-    // lambda[(Row+Col)*ORD + Col].y = moments.y * coff[Row*ORD + Col];
-    // lambda[(Row+Col)*ORD + Col].z = moments.z * coff[Row*ORD + Col];
-
-    lambda[Row*ORD + Col].x = moments.x * coff[Row*ORD + Col]; // 写入lambda矩阵的顺序错误，系数也不对
-    lambda[Row*ORD + Col].y = moments.y * coff[Row*ORD + Col];
-    lambda[Row*ORD + Col].z = moments.z * coff[Row*ORD + Col];
-  }
-  // if((Row<ORD) && (Col<ORD) && (Row<Col))
-  // {
-  //   lambda[Row*ORD + Col].x = 0.f;
-  //   lambda[Row*ORD + Col].y = 0.f;
-  //   lambda[Row*ORD + Col].z = 0.f;
-  // }
-}
-
-// // 根据公式(7)，重建图像
-// __global__ void img_recons(uchar3 *recon_img, float3 *lambda, float *p_in_Xdir, float *p_in_Ydir_trans, int imgHeight, int imgWidth)
-// {
-//   // (TILE_WIDTH + 1) * TILE_WIDTH / 2
-//   // RTX 2060 shared memory per block中能存放49152 bytes，共12288个float类型的数
-//   __shared__ float3 lam_ds[TILE_WIDTH][ORD];
-//   __shared__ float PXds[TILE_WIDTH][TILE_WIDTH];
-//   __shared__ float PYds[TILE_WIDTH][TILE_WIDTH];
-
-//   int bx = blockIdx.x; int by = blockIdx.y;
-//   int tx = threadIdx.x; int ty = threadIdx.y;
-
-//   // Identify the row and column of the recon_img element to work on
-//   int Row = by * TILE_WIDTH + ty;
-//   int Col = bx * TILE_WIDTH + tx;
-
-//   float3 imgValue; //在每个phase中累加图像的值
-//   imgValue.x = 0.f; imgValue.y = 0.f; imgValue.z = 0.f;
-
-//   //根据ORD来计算需要多少ph
-//   for(int ph=0; ph< (ORD+TILE_WIDTH-1) / TILE_WIDTH; ++ph)
-//   {
-//     // X方向
-//     if((Col < imgWidth) && (ph*TILE_WIDTH + ty) < ORD)
-//       PXds[ty][tx] = p_in_Xdir[(ph*TILE_WIDTH + ty) * imgWidth + Col];
-//     // Y方向
-//     if((Row < imgHeight) && (ph*TILE_WIDTH + tx) < ORD)
-//       PYds[ty][tx] = p_in_Ydir_trans[Row * ORD + ph*TILE_WIDTH + tx];
-
-//     // 把lambda矩阵中X方向的moments全部加载进来
-//     for(int ph_lam=0; ph_lam<(ORD+TILE_WIDTH-1) / TILE_WIDTH; ++ph_lam)
-//     {
-//       if((ph*TILE_WIDTH + ty) < ORD && (ph_lam*TILE_WIDTH + tx) < ORD)
-//         lam_ds[ty][ph_lam*TILE_WIDTH + tx] = lambda[(ph*TILE_WIDTH + ty) * ORD + ph_lam*TILE_WIDTH + tx];
-//     }
-//     __syncthreads();
-
-//     for(int i=0; i<TILE_WIDTH; ++i)
-//     {
-//       for(int j=0; j<ORD; ++j) //j<=i+ph*TILE_WIDTH
-//       {
-//         imgValue.x += lam_ds[i-j][j].x * PYds[tx][ty] * PXds[ty][tx];
-//         imgValue.y += lam_ds[i-j][j].y * PYds[tx][ty] * PXds[ty][tx];
-//         imgValue.z += lam_ds[i-j][j].z * PYds[tx][ty] * PXds[ty][tx];
-//       }
-//     }
-//     __syncthreads();
-//   }
-//   recon_img[Row*imgWidth + Col].x = __float_as_uint((imgValue.x + 1.f) * 127.5f);
-//   recon_img[Row*imgWidth + Col].y = __float_as_uint((imgValue.y + 1.f) * 127.5f);
-//   recon_img[Row*imgWidth + Col].z = __float_as_uint((imgValue.z + 1.f) * 127.5f);
-// }
-
 // 根据公式(7)，重建图像
-__global__ void img_recons(uchar3 *recon_img, float3 *lambda, float *p_in_Xdir, float *p_in_Ydir_trans, int imgHeight, int imgWidth)
+__global__ void img_recons(uchar *recon_img, float *lambda, float *p_in_Xdir, float *p_in_Ydir_trans, int imgHeight, int imgWidth)
 {
   int bx = blockIdx.x; int by = blockIdx.y;
   int tx = threadIdx.x; int ty = threadIdx.y;
@@ -298,37 +140,26 @@ __global__ void img_recons(uchar3 *recon_img, float3 *lambda, float *p_in_Xdir, 
   int Row = by * TILE_WIDTH + ty;
   int Col = bx * TILE_WIDTH + tx;
 
-  float3 imgValue; //在每个phase中累加图像的值
-  imgValue.x = 0.f; imgValue.y = 0.f; imgValue.z = 0.f;
-
+  float imgValue = 0.f; //在每个phase中累加图像的值
   if((Row<imgHeight) && (Col<imgWidth))
   {
     for(int i=0; i<ORD; ++i)  // row of lambda
     {
       for(int j=0; j<i; ++j) // col of lambda
       { // X和Y是不是反了？
-        // imgValue.x += lambda[(i-j)*ORD + j].x * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i-j];
-        // imgValue.y += lambda[(i-j)*ORD + j].y * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i-j];
-        // imgValue.z += lambda[(i-j)*ORD + j].z * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i-j];
-        
-        // imgValue.x += lambda[(i-j)*ORD + j].x * p_in_Xdir[(i-j)*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + j];
-        // imgValue.y += lambda[(i-j)*ORD + j].y * p_in_Xdir[(i-j)*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + j];
-        // imgValue.z += lambda[(i-j)*ORD + j].z * p_in_Xdir[(i-j)*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + j];
-        
-        imgValue.x += lambda[i*ORD + j].x * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i];
-        imgValue.y += lambda[i*ORD + j].y * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i];
-        imgValue.z += lambda[i*ORD + j].z * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i];
+        // imgValue += lambda[(i-j)*ORD + j] * p_in_Ydir_trans[Row*ORD + i-j] * p_in_Xdir[j*imgWidth + Col] * (float)((2*i+1) * (2*j+1)) / (float)(imgHeight * K * imgWidth * K);
+        // 在cublas里面，lambda是按照列存放的
+        imgValue += lambda[(i-j)*ORD + j] * p_in_Ydir_trans[Row*ORD + i-j] * p_in_Xdir[j*imgWidth + Col] * (float)((2*(i-j)+1) * (2*j+1)) / (float)(imgHeight * K * imgWidth * K);
+        // imgValue += lambda[i*ORD + j] * p_in_Xdir[j*imgWidth + Col] * p_in_Ydir_trans[Row*ORD + i];
       }
     }
-    recon_img[Row*imgWidth + Col].x = (imgValue.x + 1.f) * 127.5f;
-    recon_img[Row*imgWidth + Col].y = (imgValue.y + 1.f) * 127.5f;
-    recon_img[Row*imgWidth + Col].z = (imgValue.z + 1.f) * 127.5f;  
+    recon_img[Row*imgWidth + Col] = (imgValue + 1.f) * 127.5f;
   }
 }
 
 int main(void)
 {  
-  cv::Mat img_ori = cv::imread("lena.tiff"); 
+  cv::Mat img_ori = cv::imread("lena-1024.tif"); 
   //////////////////////////////////////////////////// 计算 image moments /////////////////////////////////////////////////////
   // 1、计算X和Y方向的勒让德多项式；
   // 2、把原图的每个像素分成k*k个小方格(图像双线性resize)，使得积分计算更准确
@@ -394,53 +225,50 @@ int main(void)
   dim3 gridDim_trans_k((imgWidth_k + blockDim_trans.x - 1) / blockDim_trans.x, (ORD + blockDim_trans.y - 1) / blockDim_trans.y);
   matrix_transpose<<<gridDim_trans_k, blockDim_trans>>>(p_in_Xdir_trans_k, p_in_Xdir_k, imgWidth_k, ORD);
   
-  uchar3 *oriImg;
-  float3 *resImg;
-  SAFE_CALL(cudaMalloc((void**)&oriImg, imgHeight * imgWidth * sizeof(uchar3)), "cudaMalloc oriImg failed");
-  SAFE_CALL(cudaMalloc((void**)&resImg, imgHeight_k * imgWidth_k * sizeof(float3)), "cudaMalloc resImg failed");
-  SAFE_CALL(cudaMemcpy(oriImg, img_ori.data, imgHeight * imgWidth * sizeof(uchar3), cudaMemcpyHostToDevice), "oriImg cudaMemcpyHostToDevice failed");
+  uchar *oriImg;
+  float *resImg;
+  SAFE_CALL(cudaMalloc((void**)&oriImg, imgHeight * imgWidth * sizeof(uchar)), "cudaMalloc oriImg failed");
+  SAFE_CALL(cudaMalloc((void**)&resImg, imgHeight_k * imgWidth_k * sizeof(float)), "cudaMalloc resImg failed");
+  SAFE_CALL(cudaMemcpy(oriImg, img_ori.data, imgHeight * imgWidth * sizeof(uchar), cudaMemcpyHostToDevice), "oriImg cudaMemcpyHostToDevice failed");
 
   dim3 blockDim_resize(32, 32);
   dim3 gridDim_resize((imgWidth_k + blockDim_resize.x - 1) / blockDim_resize.x, (imgHeight_k + blockDim_resize.y - 1) / blockDim_resize.y);
   inter_liner_k<<<gridDim_resize, blockDim_resize>>>(resImg, oriImg, imgHeight, imgWidth, imgHeight_k, imgWidth_k, scale);
   
-  float3 *AC;
-  SAFE_CALL(cudaMalloc((void**)&AC, imgHeight_k * ORD * sizeof(float3)), "cudaMalloc AC failed");
-  dim3 blockDim_AC(32, 32);
-  // 根据AC^T的大小，确定需要block和grid的维数
-  dim3 gridDim_AC((ORD + blockDim_AC.x - 1) / blockDim_AC.x, (imgHeight_k + blockDim_AC.y - 1) / blockDim_AC.y); 
-  cal_AC<<<gridDim_AC, blockDim_AC>>>(AC, resImg, p_in_Xdir_trans_k, imgHeight_k, imgWidth_k, total_ph_X); 
+  // 创建并初始化 CUBLAS 库对象
+  cublasHandle_t handle;
+  cublasStatus_t status = cublasCreate(&handle);
+      
+  if (status != CUBLAS_STATUS_SUCCESS)
+  {
+    if (status == CUBLAS_STATUS_NOT_INITIALIZED) {
+      std::cout << "CUBLAS 对象实例化出错" << std::endl;
+    }
+    getchar ();
+    return EXIT_FAILURE;
+  }
 
-  float3 *lambda;
-  float3 *lambda_cpu = new float3[ORD * ORD];
-  SAFE_CALL(cudaMalloc((void**)&lambda, ORD * ORD * sizeof(float3)), "cudaMalloc lambda failed");
-  dim3 blockDim_lambda(32, 32);
-  dim3 gridDim_lambda((ORD + blockDim_lambda.x - 1) / blockDim_lambda.x, (ORD + blockDim_lambda.y - 1) / blockDim_lambda.y);
-  
-  float *temp_coff = new float[ORD * ORD];
+  float *AC;
+  SAFE_CALL(cudaMalloc((void**)&AC, imgHeight_k * ORD * sizeof(float)), "cudaMalloc AC failed");
+  const float a = 1.0f, b = 0.0f;
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
+              p_in_Xdir_trans_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
+
+  float *lambda;
+  float *lambda_cpu = new float[ORD * ORD];
+  SAFE_CALL(cudaMalloc((void**)&lambda, ORD * ORD * sizeof(float)), "cudaMalloc lambda failed");
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, ORD, imgHeight_k, &a, 
+              AC, ORD, p_in_Xdir_k, imgHeight_k, &b, lambda, ORD);
+
+  SAFE_CALL(cudaMemcpy(lambda_cpu, lambda, ORD * ORD * sizeof(float), cudaMemcpyDeviceToHost), "lambda to lambda_cpu failed");
   for(int i=0; i<ORD; i++)
   {
-    for(int j=0; j<ORD; j++)
-    {
-      temp_coff[i * ORD + j] = (float)((2*i+1) * (2*j+1)) / (float)(imgHeight_k * imgWidth_k);
-      // if(j<=i)
-      //   temp_coff[i * ORD + j] = (float)((2*i+1) * (2*j+1)) / (float)(imgHeight_k * imgWidth_k);
-      // else
-      //   temp_coff[i * ORD + j] = 0.f;
+    for(int j=0; j<ORD; j++) 
+    { 
+      std::cout << lambda_cpu[i*ORD + j] <<" ";
     }
+    std::cout << std::endl;
   }
-  SAFE_CALL(cudaMemcpyToSymbol(coff, temp_coff, ORD * ORD * sizeof(float)), "cudaMemcpyToSymbol coff failed");
-  cal_lambda<<<gridDim_lambda, blockDim_lambda>>>(lambda, p_in_Ydir_k, AC, imgHeight_k, imgWidth_k, total_ph_Y);
-
-  // SAFE_CALL(cudaMemcpy(lambda_cpu, lambda, ORD * ORD * sizeof(float3), cudaMemcpyDeviceToHost), "lambda to lambda_cpu failed");
-  // for(int i=0; i<ORD; i++)
-  // {
-  //   for(int j=0; j<ORD; j++) 
-  //   { 
-  //     std::cout << lambda_cpu[i*ORD + j].x <<" "<<lambda_cpu[i*ORD + j].y <<" "<<lambda_cpu[i*ORD + j].z <<" ";
-  //   }
-  //   std::cout << std::endl;
-  // }
 
   //////////////////////////////////////////////////// 重建图像 /////////////////////////////////////////////////////
   float *p_in_Ydir_trans;
@@ -448,8 +276,8 @@ int main(void)
   dim3 gridDim_trans((imgHeight + blockDim_trans.x - 1) / blockDim_trans.x, (ORD + blockDim_trans.y - 1) / blockDim_trans.y);
   matrix_transpose<<<gridDim_trans, blockDim_trans>>>(p_in_Ydir_trans, p_in_Ydir, imgHeight, ORD);
 
-  uchar3 *recon_img;
-  SAFE_CALL(cudaMalloc((void**)&recon_img, imgWidth * imgHeight * sizeof(uchar3)), "cudaMalloc recon_img failed");
+  uchar *recon_img;
+  SAFE_CALL(cudaMalloc((void**)&recon_img, imgWidth * imgHeight * sizeof(uchar)), "cudaMalloc recon_img failed");
   dim3 blockDim_recons(32, 32);
   dim3 gridDim_recons((imgWidth + blockDim_recons.x - 1) / blockDim_recons.x, (imgHeight + blockDim_recons.y - 1) / blockDim_recons.y);
   img_recons<<<gridDim_recons, blockDim_recons>>>(recon_img, lambda, p_in_Xdir, p_in_Ydir_trans, imgHeight, imgWidth);
@@ -460,9 +288,9 @@ int main(void)
     // Possibly: exit(-1) if program cannot continue....
   } 
 
-  cv::Mat recon_img_cpu(imgHeight, imgWidth, CV_8UC3);
-  SAFE_CALL(cudaMemcpy(recon_img_cpu.data, recon_img, imgHeight*imgWidth*sizeof(uchar3), cudaMemcpyDeviceToHost), "cudaMemcpy recon_img_cpu.data failed");
-  cv::imwrite("lena_" + std::to_string(K) + "_recons.tiff", recon_img_cpu);
+  cv::Mat recon_img_cpu(imgHeight, imgWidth, CV_8UC1);
+  SAFE_CALL(cudaMemcpy(recon_img_cpu.data, recon_img, imgHeight*imgWidth*sizeof(uchar), cudaMemcpyDeviceToHost), "cudaMemcpy recon_img_cpu.data failed");
+  cv::imwrite("lena-1024_" + std::to_string(K) + "_recons.jpg", recon_img_cpu);
 
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
@@ -475,7 +303,6 @@ int main(void)
   delete[] temp_dj;
   delete[] temp_j_1;
   delete[] temp_j2_1;
-  delete[] temp_coff;
   delete[] lambda_cpu;
   // delete[] p_in_Xdir_cpu;
   // delete[] p_in_Ydir_cpu;
