@@ -10,20 +10,8 @@
 #include <chrono>
 
 #define K 5
-#define ORD 40   // Legendre polynomial的阶数order
+#define ORD 500  // Legendre polynomial的阶数order
 #define TILE_WIDTH 32 // block的宽
-
-inline __device__
-float __char_as_float(uchar b8)
-{
-  return __uint2float_rn(b8) / 127.5f - 1.f;
-}
-
-inline __device__
-char __float_as_char(float f32)
-{
-    return (char)__float_as_int(__saturatef(f32));
-}
 
 static inline void _safe_cuda_call(cudaError err, const char* msg, const char* file_name, const int line_number)
 {
@@ -85,7 +73,6 @@ __global__ void inter_liner_k(float *dataOut, uchar *dataIn, int imgHeight, int 
 __constant__ float dj[ORD];
 __constant__ float j2_1[ORD]; //2 * j -1
 __constant__ float j_1[ORD]; // j - 1
-
 // v:勒让德多项式的值； W：把[-1, 1]等分为W份； div：每一份的长度
 // 生成的多项式是(Row) * (Col): ORD * W 的矩阵
 __global__ void p_polynomial(float *v, const int W, const float div)
@@ -159,7 +146,7 @@ __global__ void img_recons(uchar *recon_img, float *lambda, float *p_in_Xdir, fl
 
 int main(void)
 {  
-  cv::Mat img_ori = cv::imread("lena-1024.tif"); 
+  cv::Mat img_ori = cv::imread("lenna-1024.tif", 0); 
   //////////////////////////////////////////////////// 计算 image moments /////////////////////////////////////////////////////
   // 1、计算X和Y方向的勒让德多项式；
   // 2、把原图的每个像素分成k*k个小方格(图像双线性resize)，使得积分计算更准确
@@ -235,7 +222,6 @@ int main(void)
   dim3 gridDim_resize((imgWidth_k + blockDim_resize.x - 1) / blockDim_resize.x, (imgHeight_k + blockDim_resize.y - 1) / blockDim_resize.y);
   inter_liner_k<<<gridDim_resize, blockDim_resize>>>(resImg, oriImg, imgHeight, imgWidth, imgHeight_k, imgWidth_k, scale);
   
-  // 创建并初始化 CUBLAS 库对象
   cublasHandle_t handle;
   cublasStatus_t status = cublasCreate(&handle);
       
@@ -244,31 +230,35 @@ int main(void)
     if (status == CUBLAS_STATUS_NOT_INITIALIZED) {
       std::cout << "CUBLAS 对象实例化出错" << std::endl;
     }
-    getchar ();
+    getchar();
     return EXIT_FAILURE;
   }
 
   float *AC;
   SAFE_CALL(cudaMalloc((void**)&AC, imgHeight_k * ORD * sizeof(float)), "cudaMalloc AC failed");
   const float a = 1.0f, b = 0.0f;
+  // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
+  //             p_in_Xdir_trans_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
               p_in_Xdir_trans_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
 
   float *lambda;
   float *lambda_cpu = new float[ORD * ORD];
   SAFE_CALL(cudaMalloc((void**)&lambda, ORD * ORD * sizeof(float)), "cudaMalloc lambda failed");
+  // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, ORD, imgHeight_k, &a, 
+  //             AC, ORD, p_in_Xdir_k, imgHeight_k, &b, lambda, ORD);
   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, ORD, imgHeight_k, &a, 
-              AC, ORD, p_in_Xdir_k, imgHeight_k, &b, lambda, ORD);
+              AC, ORD, p_in_Ydir_k, imgHeight_k, &b, lambda, ORD);
 
-  SAFE_CALL(cudaMemcpy(lambda_cpu, lambda, ORD * ORD * sizeof(float), cudaMemcpyDeviceToHost), "lambda to lambda_cpu failed");
-  for(int i=0; i<ORD; i++)
-  {
-    for(int j=0; j<ORD; j++) 
-    { 
-      std::cout << lambda_cpu[i*ORD + j] <<" ";
-    }
-    std::cout << std::endl;
-  }
+  // SAFE_CALL(cudaMemcpy(lambda_cpu, lambda, ORD * ORD * sizeof(float), cudaMemcpyDeviceToHost), "lambda to lambda_cpu failed");
+  // for(int i=0; i<ORD; i++)
+  // {
+  //   for(int j=0; j<i; j++) 
+  //   { 
+  //     std::cout << lambda_cpu[(i-j)*ORD + j] * (float)((2*(i-j)+1)*(2*j+1)) / (float)(imgHeight_k*imgWidth_k) <<" ";
+  //   }
+  //   std::cout << std::endl;
+  // }
 
   //////////////////////////////////////////////////// 重建图像 /////////////////////////////////////////////////////
   float *p_in_Ydir_trans;
@@ -290,7 +280,7 @@ int main(void)
 
   cv::Mat recon_img_cpu(imgHeight, imgWidth, CV_8UC1);
   SAFE_CALL(cudaMemcpy(recon_img_cpu.data, recon_img, imgHeight*imgWidth*sizeof(uchar), cudaMemcpyDeviceToHost), "cudaMemcpy recon_img_cpu.data failed");
-  cv::imwrite("lena-1024_" + std::to_string(K) + "_recons.jpg", recon_img_cpu);
+  cv::imwrite("lenna-1024_" + std::to_string(K) + "_recons.tif", recon_img_cpu);
 
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
