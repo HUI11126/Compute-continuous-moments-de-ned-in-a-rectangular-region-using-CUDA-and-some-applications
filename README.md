@@ -6,7 +6,7 @@ We can go two steps further:
 
 # 1.Some image related applications:
 1. Image compress. Save the coefficients of orthogonal basis in formula (7), instead of the original image. If the coefficients in formula (7) is accurate, it needs very few orthogonal polynomials to reconstruct the image. The number of coefficients would be much less than the number of pixels in the image.<br>
-bash run.sh<br>
+`bash run.sh`
 lenna-1024_3_recons.tif is the image reconstructions result.<br>
 
 2. Extract image edge information. According to the Cauchy Convergence Theorem, for any ε>0, there exists N, such that M1,M2>N, abs(fM1(x,y)-fM2(x,y))<ε. Assume M1>M2, fM1-M2(x,y) contains very small information of the original image, which is the details or edges of image. Simon Liao also mentioned that in his other papers.<br>
