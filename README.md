@@ -1,6 +1,6 @@
 I am rewriting the code in paper "A new fast algorithm to compute continuous moments deﬁned in a rectangular region" using CUDA, and try to find some applications.<br>  
 The main idea of image moments is to treat the image as a discrete two-dimensional function, and find a group of orthogonal basis functions to approach the discrete two-dimensional function. There are two important innovations: 1.Apply the nearest neighbor interpolation to calculate image moments accurately;   2.Apply matrix multiplication to accelerate the calculation.<br>  
-We can go two steps further:
+We can go three steps further:
 1. Replace the nearest neighbor interpolation with bilinear interpolation in formula (31) to calculate the integration more accurately;<br> 
 2. Integrate the formula (47) and (48), where the rows of matrix B and C are the orders of Legendre polynomials;<br> 
 3. When reconstructing the image, change the formula (47) into subdiagonal triangular matrix, and apply matrix multiplication.
