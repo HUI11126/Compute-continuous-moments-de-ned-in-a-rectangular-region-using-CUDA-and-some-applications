@@ -9,9 +9,9 @@
 #include <math.h>
 #include <chrono>
 
-#define K 3
-#define ORD 500  // Legendre polynomial的阶数order
-#define TILE_WIDTH 32 // block的宽
+#define K 11             // Legendre polynomial 在-1和1附近震荡比较厉害，所以K比较小时，图像复现效果差一些
+#define ORD 1024         // Legendre polynomial的阶数order，最好是32的倍数
+#define TILE_WIDTH 32   // block的宽
 
 static inline void _safe_cuda_call(cudaError err, const char* msg, const char* file_name, const int line_number)
 {
@@ -82,7 +82,7 @@ __global__ void p_polynomial(float *v, const int W, const float div, const float
   if(xIdx < W)
   {
     v[xIdx] = 1.0f;
-    float temp_x = div * xIdx - 1.0f + div1;
+    float temp_x = div * xIdx - 1.0f + div1; 
     v[xIdx + W] = temp_x;
     float p0 = 1.0f;
     float p1 = temp_x;
@@ -117,6 +117,7 @@ __global__ void matrix_transpose(float *odata, const float *idata, int matrixWid
     odata[y*width + x] = tile[threadIdx.x][threadIdx.y];        
 }
 
+// 根据公式(48)，乘以相应系数
 __global__ void multiply_coff(float *lambda_coff, float *lambda, int imgHeight_k, int imgWidth_k)
 {
   int bx = blockIdx.x; int by = blockIdx.y;
@@ -148,7 +149,7 @@ __global__ void recon_img_f2u(uchar *recon_img, float *recon_img_float, int imgH
 
 int main(void)
 {  
-  cv::Mat img_ori = cv::imread("lenna-1024.tif", 0); 
+  cv::Mat img_ori = cv::imread("test_images/lenna-1024.tif", 0); 
   //////////////////////////////////////////////////// 计算 image moments /////////////////////////////////////////////////////
   // 1、计算X和Y方向的勒让德多项式；
   // 2、把原图的每个像素分成k*k个小方格(图像双线性resize)，使得积分计算更准确
@@ -172,6 +173,12 @@ int main(void)
   dim3 gridDim_p_Y_k((imgHeight_k + blockDim_P.x - 1) / blockDim_P.x, 1, 1);
   dim3 gridDim_p_X((imgWidth + blockDim_P.x - 1) / blockDim_P.x, 1, 1);
   dim3 gridDim_p_Y((imgHeight + blockDim_P.x - 1) / blockDim_P.x, 1, 1);
+
+  uchar *oriImg;
+  float *resImg;
+  SAFE_CALL(cudaMalloc((void**)&oriImg, imgHeight * imgWidth * sizeof(uchar)), "cudaMalloc oriImg failed");
+  SAFE_CALL(cudaMalloc((void**)&resImg, imgHeight_k * imgWidth_k * sizeof(float)), "cudaMalloc resImg failed");
+  SAFE_CALL(cudaMemcpy(oriImg, img_ori.data, imgHeight * imgWidth * sizeof(uchar), cudaMemcpyHostToDevice), "oriImg cudaMemcpyHostToDevice failed");
   
   cudaEvent_t start, stop;
   float runtime;
@@ -217,12 +224,6 @@ int main(void)
   SAFE_CALL(cudaMalloc((void**)&p_in_Xdir_trans_k, ORD * imgWidth_k * sizeof(float)), "cudaMalloc p_in_Xdir_trans_k failed");   
   dim3 gridDim_trans_k((imgWidth_k + blockDim_trans.x - 1) / blockDim_trans.x, (ORD + blockDim_trans.y - 1) / blockDim_trans.y);
   matrix_transpose<<<gridDim_trans_k, blockDim_trans>>>(p_in_Xdir_trans_k, p_in_Xdir_k, imgWidth_k, ORD);
-  
-  uchar *oriImg;
-  float *resImg;
-  SAFE_CALL(cudaMalloc((void**)&oriImg, imgHeight * imgWidth * sizeof(uchar)), "cudaMalloc oriImg failed");
-  SAFE_CALL(cudaMalloc((void**)&resImg, imgHeight_k * imgWidth_k * sizeof(float)), "cudaMalloc resImg failed");
-  SAFE_CALL(cudaMemcpy(oriImg, img_ori.data, imgHeight * imgWidth * sizeof(uchar), cudaMemcpyHostToDevice), "oriImg cudaMemcpyHostToDevice failed");
 
   dim3 blockDim_resize(32, 32);
   dim3 gridDim_resize((imgWidth_k + blockDim_resize.x - 1) / blockDim_resize.x, (imgHeight_k + blockDim_resize.y - 1) / blockDim_resize.y);
@@ -243,16 +244,16 @@ int main(void)
   float *AC;
   SAFE_CALL(cudaMalloc((void**)&AC, imgHeight_k * ORD * sizeof(float)), "cudaMalloc AC failed");
   const float a = 1.0f, b = 0.0f;
-  // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
-  //             p_in_Xdir_trans_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
               p_in_Xdir_trans_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
+
+  // p_in_Xdir_k 用cublas内置函数转置
+  // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, ORD, imgHeight_k, imgWidth_k, &a, 
+  //           p_in_Xdir_k, ORD, resImg, imgWidth_k, &b, AC, ORD);
 
   float *lambda;
   float *lambda_cpu = new float[ORD * ORD];
   SAFE_CALL(cudaMalloc((void**)&lambda, ORD * ORD * sizeof(float)), "cudaMalloc lambda failed");
-  // cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, ORD, imgHeight_k, &a, 
-  //             AC, ORD, p_in_Xdir_k, imgHeight_k, &b, lambda, ORD);
   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ORD, ORD, imgHeight_k, &a, 
               AC, ORD, p_in_Ydir_k, imgHeight_k, &b, lambda, ORD);
 
@@ -272,7 +273,6 @@ int main(void)
   dim3 gridDim_trans((imgHeight + blockDim_trans.x - 1) / blockDim_trans.x, (ORD + blockDim_trans.y - 1) / blockDim_trans.y);
   matrix_transpose<<<gridDim_trans, blockDim_trans>>>(p_in_Ydir_trans, p_in_Ydir, imgHeight, ORD);
 
-  // 根据公式(48)，乘以相应系数
   float *lambda_coff;
   SAFE_CALL(cudaMalloc((void**)&lambda_coff, ORD * ORD * sizeof(float)), "cudaMalloc lambda_coff failed");
   dim3 blockDim_coff(32, 32);
@@ -299,17 +299,29 @@ int main(void)
     // Possibly: exit(-1) if program cannot continue....
   } 
 
-  cv::Mat recon_img_cpu(imgHeight, imgWidth, CV_8UC1);
-  SAFE_CALL(cudaMemcpy(recon_img_cpu.data, recon_img, imgHeight*imgWidth*sizeof(uchar), cudaMemcpyDeviceToHost), "cudaMemcpy recon_img_cpu.data failed");
-  cv::imwrite("lenna-1024_" + std::to_string(K) + "_recons.tif", recon_img_cpu);
-
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&runtime, start, stop);
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
-  
   std::cout << "cudaEvent_t time: " << runtime * 1000 << " us" << std::endl;
+
+  cv::Mat recon_img_cpu(imgHeight, imgWidth, CV_8UC1);
+  SAFE_CALL(cudaMemcpy(recon_img_cpu.data, recon_img, imgHeight*imgWidth*sizeof(uchar), cudaMemcpyDeviceToHost), "cudaMemcpy recon_img_cpu.data failed");
+  cv::imwrite("test_images/lenna-1024_" + std::to_string(K) +"_"+ std::to_string(ORD) + "_recons.tif", recon_img_cpu);
+
+  float MSE=0.f, PSNR=0.f;
+  for (int i = 0; i < imgHeight; i++)
+	{
+		for (int j = 0; j < imgWidth; j++)
+		{
+			MSE += (img_ori.ptr<uchar>(i)[j] - recon_img_cpu.ptr<uchar>(i)[j])*(img_ori.ptr<uchar>(i)[j] - recon_img_cpu.ptr<uchar>(i)[j]);
+		}
+	}
+	MSE = MSE / (imgHeight * imgWidth);
+  PSNR = 20 * log10(255) - 10 * log10(MSE);
+  std::cout << "MSE: " << MSE << std::endl;
+  std::cout << "PSNR: " << PSNR << std::endl;
   
   delete[] temp_dj;
   delete[] temp_j_1;
