@@ -14,7 +14,7 @@ We can go three steps further:
    \end{matrix}\right].$$
 
 # 1.Some image related applications:
-1. Image reconstruction. The MSE is 1.8 and PSNR is 45.5<br>
+1. Image reconstruction. When the K is 11 and order is 1024, the MSE is 1.8 and PSNR is 45.5<br>
 `bash run.sh`<br>
 ./test_images/lenna-1024_11_1024_recons.tif is the image reconstructions result.
 ![image](./test_images/lenna-1024_11_1024_recons.tif)<br>
