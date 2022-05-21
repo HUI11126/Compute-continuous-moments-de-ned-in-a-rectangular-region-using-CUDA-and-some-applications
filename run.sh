@@ -4,4 +4,5 @@ rm -r *
 cmake -D CMAKE_BUILD_TYPE=RELEASE .. 
 make
 cd ..
-./build/rectangular
+# ./build/edge_extraction
+./build/reconstruction
