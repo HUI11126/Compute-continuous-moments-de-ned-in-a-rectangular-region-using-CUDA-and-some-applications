@@ -61,12 +61,12 @@ Run `nvprof ./build/edge_extraction ` to see the kernel time.<br>
                         0.03%  1.9840us         2     992ns     864ns  1.1200us  [CUDA memset]
     ```
 // TODO<br>
-3. Calaulate image gradient in X and Y direction. The basis functions is uniformly continuous, we can exchange the order of integral and summation in formula (6) and (7), calculate the partial derivative in X and Y direction.<br>
+3. Calaulate image gradient in X and Y direction. The basis functions is uniformly continuous, we can exchange the order of integral and summation in formula (6) and (7), calculate the partial derivative in X and Y direction. The f_{n}'(x,y) is not Uniform Convergence, that does not work.<br>
 4. Image resize. When restructing the image, divide the [-1, 1] into different pieces to get a bigger or smaller image.<br>  
 
 # 2.Point cloud related applications:
 Point cloud is a discrete three-dimensional function, we can get similar results as image.<br> 
 1. point cloud compress.<br>
 2. Extract point cloud edge information.<br>
-3. Calculate the gradient in X, Y and Z direction of each point. This may be important in self-driving. For example, we can detects obstacles, uphills, downhills, speed bumps, curbs, puddles, etc. to get a drivable area by calculating the gradient in Z direction.<br>
+3. Calculate the gradient in X, Y and Z direction of each point. This may be important in self-driving. For example, we can detects obstacles, uphills, downhills, speed bumps, curbs, puddles, etc. to get a drivable area by calculating the gradient in Z direction. Same as the image, that does not work.<br>
 4. Make point cloud dense or sparse. We can get the point values in fixed positions, and turn a frame of messy point clouds into a regular sparse matrix.<br>  
